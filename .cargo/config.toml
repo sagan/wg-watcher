@@ -1,0 +1,3 @@
+[target.mipsel-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+soft-float"]
+
