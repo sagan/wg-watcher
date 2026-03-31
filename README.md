@@ -25,6 +25,7 @@ Monitors WireGuard interface connections to keep client sessions alive.
 How it works:
 1. Runs `wg show all dump` periodically (every 25 seconds) and parses the result.
 2. For each specified `wg` interface that has at least one peer with "persistent keepalive" set, if the "latest handshake" is older than 180 seconds (wg session key valid time limit), it runs `wg set <interface> listen-port 0` to randomize the listen port and force a handshake attempt to reconnect.
+3. It also updates the endpoint to the one defined in the static config if the current endpoint is inaccessible and different from the one in the static config.
 
 ## Usage
 
