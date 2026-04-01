@@ -25,21 +25,34 @@ Monitors WireGuard interface connections to keep client sessions alive.
 How it works:
 1. Runs `wg show all dump` periodically (every 25 seconds) and parses the result.
 2. For each specified `wg` interface that has at least one peer with "persistent keepalive" set, if the "latest handshake" is older than 180 seconds (wg session key valid time limit), it runs `wg set <interface> listen-port 0` to randomize the listen port and force a handshake attempt to reconnect.
-3. It also updates the endpoint to the one defined in the static config if the current endpoint is inaccessible and different from the one in the static config.
+3. It also updates the endpoint to the one defined in the static config if the current endpoint is inaccessible and different from the one in the static config. It does DNS resolving internally and round-robins through all resolved IPs
+if the hostname part of wg.conf `Endpoint` is a domain.
 
 ## Usage
 
-```sh
-./wg-watcher -h
+```
+# ./wg-watcher  -h
+wg-watcher: A combined WireGuard utility daemon.
+
+Features:
+1. Dynamic AllowedIPs: Watches Linux kernel routes and dynamically updates WireGuard peer's `allowed-ips`.
+   Intended to be used to help run BGP / OSPF over WireGuard mesh network.
+2. Keepalived: Monitors WireGuard peers' handshakes and resets `listen-port` to `0` if a
+   handshake times out (older than 180s) on peers with persistent keepalive set.
+   It also updates the endpoint to the one defined in the static config if the current
+   endpoint is inaccessible and different from the one in the static config.
+
 
 Usage: wg-watcher [OPTIONS]
 
 Options:
-  -i, --interface <INTERFACE>    Specific WireGuard interface to watch (e.g., wg0). Watches all wg* interfaces if omitted
-  -c, --config-dir <CONFIG_DIR>  Directory containing WireGuard .conf files for static routing base. Set to "none" to disable parsing [default: /etc/wireguard]
-  -p, --pidfile <PIDFILE>        Path to write the daemon's PID file. Set to "none" to disable [default: /var/run/wg-watcher.pid]
-  -h, --help                     Print help
-  -V, --version                  Print version
+  -i, --interface <INTERFACE>     Specific WireGuard interface to watch (e.g., wg0). Watches all wg* interfaces if omitted
+  -c, --config-dir <CONFIG_DIR>   Directory containing WireGuard .conf files for static routing base. Set to "none" to disable parsing [default: /etc/wireguard]
+  -p, --pidfile <PIDFILE>         Path to write the daemon's PID file. Set to "none" to disable [default: /var/run/wg-watcher.pid]
+      --disable-endpoint-watcher  Disable tracking and applying endpoints from config for stale peers
+      --disable-dns-resolution    Disable tracking failed IP addresses for DNS-resolved endpoints
+  -h, --help                      Print help
+  -V, --version                   Print version
 ```
 
 ## Build

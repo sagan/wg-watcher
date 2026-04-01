@@ -6,6 +6,7 @@ use signal_hook::iterator::Signals;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::net::ToSocketAddrs;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -28,6 +29,8 @@ Features:
    handshake times out (older than 180s) on peers with persistent keepalive set.
    It also updates the endpoint to the one defined in the static config if the current
    endpoint is inaccessible and different from the one in the static config.
+   It does DNS resolving internally and round-robins through all resolved IPs
+   if the hostname part of wg.conf `Endpoint` is a domain.
 "#
 )]
 struct Args {
@@ -47,6 +50,10 @@ struct Args {
     /// Disable tracking and applying endpoints from config for stale peers.
     #[arg(long)]
     disable_endpoint_watcher: bool,
+
+    /// Disable tracking failed IP addresses for DNS-resolved endpoints.
+    #[arg(long)]
+    disable_dns_resolution: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +75,12 @@ struct PeerState {
 struct PeerConfig {
     allowed_ips: Vec<String>,
     endpoint: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct WgConfig {
+    listen_port: Option<u16>,
+    peers: std::collections::HashMap<String, PeerConfig>,
 }
 
 fn main() {
@@ -101,13 +114,23 @@ fn main() {
     let keepalive_iface = args.interface.clone();
     let keepalive_config_dir = args.config_dir.clone();
     let disable_endpoint_watcher = args.disable_endpoint_watcher;
+    let disable_dns_resolution = args.disable_dns_resolution;
+
     thread::spawn(move || {
         println!(
             "Starting keepalived monitor: Handshakes > {}s on peers with Keepalive set. Action: 'wg set <interface> listen-port 0'",
             HANDSHAKE_TIMEOUT_SEC
         );
+        // Maps Peer PublicKey -> (Endpoint IP:Port -> Failure Timestamp)
+        let mut failed_endpoints: HashMap<String, HashMap<String, u64>> = HashMap::new();
         loop {
-            if let Err(e) = check_and_recover(&keepalive_iface, &keepalive_config_dir, disable_endpoint_watcher) {
+            if let Err(e) = check_and_recover(
+                &keepalive_iface,
+                &keepalive_config_dir,
+                disable_endpoint_watcher,
+                disable_dns_resolution,
+                &mut failed_endpoints,
+            ) {
                 eprintln!("Error during keepalived check cycle: {}", e);
             }
             thread::sleep(Duration::from_secs(CHECK_INTERVAL_SEC));
@@ -184,6 +207,8 @@ fn check_and_recover(
     target_interface: &Option<String>,
     config_dir: &str,
     disable_endpoint_watcher: bool,
+    disable_dns_resolution: bool,
+    failed_endpoints: &mut HashMap<String, HashMap<String, u64>>,
 ) -> std::io::Result<()> {
     // 1. Run "wg show all dump"
     // Format: intf, peer_pub, psk, endpoint, allowed_ips, latest_handshake, rx, tx, persistent_keepalive
@@ -206,7 +231,7 @@ fn check_and_recover(
 
     // Use a Set to avoid resetting the same interface multiple times in one cycle
     let mut stale_interfaces = HashSet::new();
-    let mut interface_configs: HashMap<String, HashMap<String, PeerConfig>> = HashMap::new();
+    let mut interface_configs: HashMap<String, WgConfig> = HashMap::new();
 
     for line in stdout.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
@@ -244,36 +269,99 @@ fn check_and_recover(
             let peer_pub = fields[1];
             let current_endpoint = fields[3];
 
+            // Record this current endpoint as failed right now.
+            if current_endpoint != "(none)" {
+                failed_endpoints
+                    .entry(peer_pub.to_string())
+                    .or_default()
+                    .insert(current_endpoint.to_string(), now);
+            }
+
             if !disable_endpoint_watcher && config_dir.to_lowercase() != "none" {
-                let conf_map = interface_configs.entry(interface.to_string()).or_insert_with(|| {
+                let conf = interface_configs.entry(interface.to_string()).or_insert_with(|| {
                     let conf_path = format!("{}/{}.conf", config_dir, interface);
                     parse_wg_conf(&conf_path)
                 });
 
-                if let Some(config) = conf_map.get(peer_pub) {
+                if let Some(config) = conf.peers.get(peer_pub) {
                     if let Some(config_endpoint) = &config.endpoint {
-                        if config_endpoint != current_endpoint {
+                        let mut chosen_endpoint = config_endpoint.clone();
+
+                        if !disable_dns_resolution {
+                            if let Ok(addrs) = config_endpoint.to_socket_addrs() {
+                                let mut addrs: Vec<std::net::SocketAddr> = addrs.collect();
+                                if !addrs.is_empty() {
+                                    let resolved_ips: HashSet<String> = addrs.iter().map(|a| a.to_string()).collect();
+
+                                    // Clean up failed IPs that are no longer part of the current endpoint DNS pool
+                                    if let Some(peer_fails) = failed_endpoints.get_mut(peer_pub) {
+                                        peer_fails.retain(|ip, _| resolved_ips.contains(ip));
+                                    }
+
+                                    // Sort by failure time (0 = never failed). We want lowest first.
+                                    addrs.sort_by_key(|addr| {
+                                        failed_endpoints
+                                            .get(peer_pub)
+                                            .and_then(|m| m.get(&addr.to_string()))
+                                            .copied()
+                                            .unwrap_or(0)
+                                    });
+                                    chosen_endpoint = addrs[0].to_string();
+                                }
+                            }
+                        }
+
+                        if chosen_endpoint != current_endpoint {
                             println!(
                                 "[{}] Stale endpoint detected! Interface: {}, Peer: {}, Old: {}, New: {}",
-                                now, interface, &peer_pub[..8], current_endpoint, config_endpoint
+                                now, interface, &peer_pub[..8], current_endpoint, chosen_endpoint
                             );
                             let status = Command::new("wg")
-                                .args(["set", interface, "peer", peer_pub, "endpoint", config_endpoint])
+                                .args(["set", interface, "peer", peer_pub, "endpoint", &chosen_endpoint])
                                 .status();
                             if let Err(e) = status {
                                 eprintln!("Failed to update endpoint for peer {}: {}", peer_pub, e);
                             }
                         }
+                    } else {
+                        // Static config no longer defines an endpoint for this peer.
+                        // We shouldn't track failing DDNS IPs anymore.
+                        failed_endpoints.remove(peer_pub);
                     }
                 }
             }
 
-            if !stale_interfaces.contains(interface) {
+            // Before marking as stale to reset listen-port, check if static config defines ListenPort.
+            // We need to parse it if we haven't already.
+            let mut skip_reset = false;
+            if config_dir.to_lowercase() != "none" {
+                let conf = interface_configs.entry(interface.to_string()).or_insert_with(|| {
+                    let conf_path = format!("{}/{}.conf", config_dir, interface);
+                    parse_wg_conf(&conf_path)
+                });
+                if conf.listen_port.is_some() {
+                    skip_reset = true;
+                }
+            }
+
+            if !skip_reset && !stale_interfaces.contains(interface) {
                 println!(
                     "[{}] Stale detected! Interface: {}, Peer Keepalive: {}, Handshake Age: {}s",
                     now, interface, keepalive, age
                 );
                 stale_interfaces.insert(interface.to_string());
+            }
+        } else {
+            // Handshake is recent, connection is healthy.
+            let current_endpoint = fields[3];
+            let peer_pub = fields[1];
+            if current_endpoint != "(none)" {
+                if let Some(peer_fails) = failed_endpoints.get_mut(peer_pub) {
+                    peer_fails.remove(current_endpoint);
+                    if peer_fails.is_empty() {
+                        failed_endpoints.remove(peer_pub);
+                    }
+                }
             }
         }
     }
@@ -363,13 +451,13 @@ fn get_bird_routes() -> Vec<Route> {
     routes
 }
 
-fn parse_wg_conf(path: &str) -> HashMap<String, PeerConfig> {
-    let mut map: HashMap<String, PeerConfig> = HashMap::new();
+fn parse_wg_conf(path: &str) -> WgConfig {
+    let mut config = WgConfig::default();
     let file = match File::open(path) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("Warning: Could not open static config {}: {}", path, e);
-            return map;
+            return config;
         }
     };
 
@@ -384,11 +472,17 @@ fn parse_wg_conf(path: &str) -> HashMap<String, PeerConfig> {
 
         if line.starts_with("[Peer]") {
             current_pubkey = None;
+        } else if line.to_lowercase().starts_with("listenport") {
+            if let Some((_, port_str)) = line.split_once('=') {
+                if let Ok(port) = port_str.trim().parse::<u16>() {
+                    config.listen_port = Some(port);
+                }
+            }
         } else if line.to_lowercase().starts_with("publickey") {
             if let Some((_, key)) = line.split_once('=') {
                 let key = key.trim().to_string();
                 current_pubkey = Some(key.clone());
-                map.entry(key).or_insert_with(PeerConfig::default);
+                config.peers.entry(key).or_insert_with(PeerConfig::default);
             }
         } else if line.to_lowercase().starts_with("allowedips") {
             if let Some(pubkey) = &current_pubkey {
@@ -399,22 +493,22 @@ fn parse_wg_conf(path: &str) -> HashMap<String, PeerConfig> {
                         .filter(|s| !s.is_empty())
                         .collect();
 
-                    if let Some(config) = map.get_mut(pubkey) {
-                        config.allowed_ips.extend(ips);
+                    if let Some(peer_cfg) = config.peers.get_mut(pubkey) {
+                        peer_cfg.allowed_ips.extend(ips);
                     }
                 }
             }
         } else if line.to_lowercase().starts_with("endpoint") {
             if let Some(pubkey) = &current_pubkey {
                 if let Some((_, endpoint_str)) = line.split_once('=') {
-                    if let Some(config) = map.get_mut(pubkey) {
-                        config.endpoint = Some(endpoint_str.trim().to_string());
+                    if let Some(peer_cfg) = config.peers.get_mut(pubkey) {
+                        peer_cfg.endpoint = Some(endpoint_str.trim().to_string());
                     }
                 }
             }
         }
     }
-    map
+    config
 }
 
 fn update_wireguard_interface(iface: &str, all_routes: &[Route], config_dir: &str) {
@@ -459,13 +553,13 @@ fn update_wireguard_interface(iface: &str, all_routes: &[Route], config_dir: &st
         let conf_path = format!("{}/{}.conf", config_dir, iface);
         parse_wg_conf(&conf_path)
     } else {
-        HashMap::new()
+        WgConfig::default()
     };
 
     for peer in active_peers {
         let mut target_ips_set: HashSet<String> = HashSet::new();
 
-        if let Some(static_peer) = static_config.get(&peer.pubkey) {
+        if let Some(static_peer) = static_config.peers.get(&peer.pubkey) {
             for ip in &static_peer.allowed_ips {
                 // Apply normalization here
                 target_ips_set.insert(normalize_ip(ip));
