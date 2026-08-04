@@ -41,6 +41,10 @@ Features:
    handshake times out (older than 180s) on peers with persistent keepalive set.
    It also updates the endpoint to the one defined in the static config if the current
    endpoint is inaccessible and different from the one in the static config.
+   It does DNS resolving internally and round-robins through all resolved IPs
+   if the hostname part of wg.conf `Endpoint` is a domain.
+   When `--enable-multiple-endpoints` is passed, it allows peers to define multiple `Endpoint`
+   lines in `wg.conf`, trying them in reverse order of appearance (since `wg-quick` uses the last defined endpoint).
 
 
 Usage: wg-watcher [OPTIONS]
@@ -51,6 +55,7 @@ Options:
   -p, --pidfile <PIDFILE>         Path to write the daemon's PID file. Set to "none" to disable [default: /var/run/wg-watcher.pid]
       --disable-endpoint-watcher  Disable tracking and applying endpoints from config for stale peers
       --disable-dns-resolution    Disable tracking failed IP addresses for DNS-resolved endpoints
+      --enable-multiple-endpoints Enable watching and rotating through multiple Endpoint definitions per peer in wg.conf
   -h, --help                      Print help
   -V, --version                   Print version
 ```

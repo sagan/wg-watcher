@@ -54,6 +54,10 @@ struct Args {
     /// Disable tracking failed IP addresses for DNS-resolved endpoints.
     #[arg(long)]
     disable_dns_resolution: bool,
+
+    /// Enable watching and rotating through multiple Endpoint definitions per peer in wg.conf.
+    #[arg(long)]
+    enable_multiple_endpoints: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -74,7 +78,7 @@ struct PeerState {
 #[derive(Debug, Default)]
 struct PeerConfig {
     allowed_ips: Vec<String>,
-    endpoint: Option<String>,
+    endpoints: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -110,11 +114,16 @@ fn main() {
         println!("Reading static config base from: {}", args.config_dir);
     }
 
+    if args.enable_multiple_endpoints {
+        println!("Multiple endpoints watching enabled (trying defined endpoints in reverse config order).");
+    }
+
     // 2. Spawn keepalived thread
     let keepalive_iface = args.interface.clone();
     let keepalive_config_dir = args.config_dir.clone();
     let disable_endpoint_watcher = args.disable_endpoint_watcher;
     let disable_dns_resolution = args.disable_dns_resolution;
+    let enable_multiple_endpoints = args.enable_multiple_endpoints;
 
     thread::spawn(move || {
         println!(
@@ -129,6 +138,7 @@ fn main() {
                 &keepalive_config_dir,
                 disable_endpoint_watcher,
                 disable_dns_resolution,
+                enable_multiple_endpoints,
                 &mut failed_endpoints,
             ) {
                 eprintln!("Error during keepalived check cycle: {}", e);
@@ -208,6 +218,7 @@ fn check_and_recover(
     config_dir: &str,
     disable_endpoint_watcher: bool,
     disable_dns_resolution: bool,
+    enable_multiple_endpoints: bool,
     failed_endpoints: &mut HashMap<String, HashMap<String, u64>>,
 ) -> std::io::Result<()> {
     // 1. Run "wg show all dump"
@@ -284,43 +295,73 @@ fn check_and_recover(
                 });
 
                 if let Some(config) = conf.peers.get(peer_pub) {
-                    if let Some(config_endpoint) = &config.endpoint {
-                        let mut chosen_endpoint = config_endpoint.clone();
+                    let configured_endpoints: Vec<String> = if enable_multiple_endpoints {
+                        config.endpoints.iter().rev().cloned().collect()
+                    } else {
+                        config.endpoints.last().cloned().into_iter().collect()
+                    };
 
-                        if !disable_dns_resolution {
-                            if let Ok(addrs) = config_endpoint.to_socket_addrs() {
-                                let mut addrs: Vec<std::net::SocketAddr> = addrs.collect();
-                                if !addrs.is_empty() {
-                                    let resolved_ips: HashSet<String> = addrs.iter().map(|a| a.to_string()).collect();
+                    if !configured_endpoints.is_empty() {
+                        let mut candidate_ips: Vec<String> = Vec::new();
 
-                                    // Clean up failed IPs that are no longer part of the current endpoint DNS pool
-                                    if let Some(peer_fails) = failed_endpoints.get_mut(peer_pub) {
-                                        peer_fails.retain(|ip, _| resolved_ips.contains(ip));
+                        for ep in &configured_endpoints {
+                            if !disable_dns_resolution {
+                                if let Ok(addrs) = ep.to_socket_addrs() {
+                                    let addrs_vec: Vec<String> = addrs.map(|a| a.to_string()).collect();
+                                    if !addrs_vec.is_empty() {
+                                        candidate_ips.extend(addrs_vec);
+                                    } else {
+                                        candidate_ips.push(ep.clone());
                                     }
-
-                                    // Sort by failure time (0 = never failed). We want lowest first.
-                                    addrs.sort_by_key(|addr| {
-                                        failed_endpoints
-                                            .get(peer_pub)
-                                            .and_then(|m| m.get(&addr.to_string()))
-                                            .copied()
-                                            .unwrap_or(0)
-                                    });
-                                    chosen_endpoint = addrs[0].to_string();
+                                } else {
+                                    candidate_ips.push(ep.clone());
                                 }
+                            } else {
+                                candidate_ips.push(ep.clone());
                             }
                         }
 
-                        if chosen_endpoint != current_endpoint {
-                            println!(
-                                "[{}] Stale endpoint detected! Interface: {}, Peer: {}, Old: {}, New: {}",
-                                now, interface, &peer_pub[..8], current_endpoint, chosen_endpoint
-                            );
-                            let status = Command::new("wg")
-                                .args(["set", interface, "peer", peer_pub, "endpoint", &chosen_endpoint])
-                                .status();
-                            if let Err(e) = status {
-                                eprintln!("Failed to update endpoint for peer {}: {}", peer_pub, e);
+                        if !candidate_ips.is_empty() {
+                            let candidate_set: HashSet<String> = candidate_ips.iter().cloned().collect();
+
+                            // Clean up failed IPs that are no longer part of candidate pool
+                            if let Some(peer_fails) = failed_endpoints.get_mut(peer_pub) {
+                                peer_fails.retain(|ip, _| candidate_set.contains(ip));
+                            }
+
+                            // Deduplicate candidate_ips while preserving first-occurrence order
+                            let mut unique_candidates = Vec::new();
+                            let mut seen = HashSet::new();
+                            for ip in candidate_ips {
+                                if seen.insert(ip.clone()) {
+                                    unique_candidates.push(ip);
+                                }
+                            }
+
+                            // Sort by failure time (0 = never failed). We want lowest first.
+                            // Since sort_by_key is stable, elements with equal failure time (e.g. 0)
+                            // retain their unique_candidates order.
+                            unique_candidates.sort_by_key(|ip| {
+                                failed_endpoints
+                                    .get(peer_pub)
+                                    .and_then(|m| m.get(ip))
+                                    .copied()
+                                    .unwrap_or(0)
+                            });
+
+                            let chosen_endpoint = &unique_candidates[0];
+
+                            if chosen_endpoint != current_endpoint {
+                                println!(
+                                    "[{}] Stale endpoint detected! Interface: {}, Peer: {}, Old: {}, New: {}",
+                                    now, interface, &peer_pub[..8], current_endpoint, chosen_endpoint
+                                );
+                                let status = Command::new("wg")
+                                    .args(["set", interface, "peer", peer_pub, "endpoint", chosen_endpoint])
+                                    .status();
+                                if let Err(e) = status {
+                                    eprintln!("Failed to update endpoint for peer {}: {}", peer_pub, e);
+                                }
                             }
                         }
                     } else {
@@ -502,7 +543,7 @@ fn parse_wg_conf(path: &str) -> WgConfig {
             if let Some(pubkey) = &current_pubkey {
                 if let Some((_, endpoint_str)) = line.split_once('=') {
                     if let Some(peer_cfg) = config.peers.get_mut(pubkey) {
-                        peer_cfg.endpoint = Some(endpoint_str.trim().to_string());
+                        peer_cfg.endpoints.push(endpoint_str.trim().to_string());
                     }
                 }
             }
@@ -624,3 +665,37 @@ fn normalize_ip(ip: &str) -> String {
         format!("{}/32", ip)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_multiple_endpoints() {
+        let conf_content = r#"
+[Peer]
+PublicKey = test_pubkey_123
+Endpoint = 1.2.3.4:51820
+Endpoint = 2.3.4.5:51820
+"#;
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("test_wg.conf");
+        std::fs::write(&test_file, conf_content).unwrap();
+
+        let config = parse_wg_conf(test_file.to_str().unwrap());
+        let peer = config.peers.get("test_pubkey_123").unwrap();
+
+        assert_eq!(peer.endpoints, vec!["1.2.3.4:51820", "2.3.4.5:51820"]);
+
+        // When multiple endpoints feature is disabled: last endpoint used
+        let single_ep: Vec<String> = peer.endpoints.last().cloned().into_iter().collect();
+        assert_eq!(single_ep, vec!["2.3.4.5:51820"]);
+
+        // When multiple endpoints feature is enabled: try in reverse config order
+        let multi_eps: Vec<String> = peer.endpoints.iter().rev().cloned().collect();
+        assert_eq!(multi_eps, vec!["2.3.4.5:51820", "1.2.3.4:51820"]);
+
+        std::fs::remove_file(test_file).ok();
+    }
+}
+
