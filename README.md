@@ -56,6 +56,7 @@ Options:
       --disable-endpoint-watcher  Disable tracking and applying endpoints from config for stale peers
       --disable-dns-resolution    Disable tracking failed IP addresses for DNS-resolved endpoints
       --enable-multiple-endpoints Enable watching and rotating through multiple Endpoint definitions per peer in wg.conf
+      --reset-endpoint            Parse config file, reset all peer endpoints to their primary endpoint, and exit
   -h, --help                      Print help
   -V, --version                   Print version
 ```

@@ -58,6 +58,10 @@ struct Args {
     /// Enable watching and rotating through multiple Endpoint definitions per peer in wg.conf.
     #[arg(long)]
     enable_multiple_endpoints: bool,
+
+    /// Parse config file, reset all peer endpoints to their primary endpoint, and exit.
+    #[arg(long)]
+    reset_endpoint: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +93,11 @@ struct WgConfig {
 
 fn main() {
     let args = Args::parse();
+
+    if args.reset_endpoint {
+        reset_endpoints(&args.interface, &args.config_dir);
+        return;
+    }
 
     println!("Starting wg-watcher...");
 
@@ -666,6 +675,110 @@ fn normalize_ip(ip: &str) -> String {
     }
 }
 
+fn reset_endpoints(target_interface: &Option<String>, config_dir: &str) {
+    if config_dir.to_lowercase() == "none" {
+        println!("Static config parsing disabled. Cannot reset endpoints.");
+        return;
+    }
+
+    let mut interfaces: HashSet<String> = HashSet::new();
+    if let Some(iface) = target_interface {
+        interfaces.insert(iface.clone());
+    } else {
+        if let Ok(entries) = std::fs::read_dir(config_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("conf") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        if stem.starts_with("wg") {
+                            interfaces.insert(stem.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Ok(output) = Command::new("wg").args(["show", "all", "dump"]).output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    let fields: Vec<&str> = line.split_whitespace().collect();
+                    if fields.len() >= 9 {
+                        let iface = fields[0];
+                        if iface.starts_with("wg") {
+                            interfaces.insert(iface.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut current_endpoints: HashMap<(String, String), String> = HashMap::new();
+    if let Ok(output) = Command::new("wg").args(["show", "all", "dump"]).output() {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.len() >= 9 {
+                    let iface = fields[0].to_string();
+                    let peer_pub = fields[1].to_string();
+                    let endpoint = fields[3].to_string();
+                    current_endpoints.insert((iface, peer_pub), endpoint);
+                }
+            }
+        }
+    }
+
+    let mut iface_list: Vec<String> = interfaces.into_iter().collect();
+    iface_list.sort();
+
+    for iface in iface_list {
+        let conf_path = format!("{}/{}.conf", config_dir, iface);
+        let config = parse_wg_conf(&conf_path);
+
+        let mut peer_pubkeys: Vec<String> = config.peers.keys().cloned().collect();
+        peer_pubkeys.sort();
+
+        for pubkey in peer_pubkeys {
+            if let Some(peer_cfg) = config.peers.get(&pubkey) {
+                if let Some(primary_ep) = peer_cfg.endpoints.last() {
+                    let peer_short = &pubkey[..8.min(pubkey.len())];
+                    if let Some(curr) = current_endpoints.get(&(iface.clone(), pubkey.clone())) {
+                        println!(
+                            "Resetting endpoint for interface {}, peer {}: {} -> {}",
+                            iface, peer_short, curr, primary_ep
+                        );
+                    } else {
+                        println!(
+                            "Resetting endpoint for interface {}, peer {}: -> {}",
+                            iface, peer_short, primary_ep
+                        );
+                    }
+
+                    let status = Command::new("wg")
+                        .args(["set", &iface, "peer", &pubkey, "endpoint", primary_ep])
+                        .status();
+
+                    if let Err(e) = status {
+                        eprintln!(
+                            "Failed to update endpoint for peer {} on interface {}: {}",
+                            pubkey, iface, e
+                        );
+                    } else if let Ok(s) = status {
+                        if !s.success() {
+                            eprintln!(
+                                "Command 'wg set {} peer {} endpoint {}' failed",
+                                iface, pubkey, primary_ep
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,6 +809,12 @@ Endpoint = 2.3.4.5:51820
         assert_eq!(multi_eps, vec!["2.3.4.5:51820", "1.2.3.4:51820"]);
 
         std::fs::remove_file(test_file).ok();
+    }
+
+    #[test]
+    fn test_reset_endpoint_flag_arg_parse() {
+        let args = Args::parse_from(["wg-watcher", "--reset-endpoint"]);
+        assert!(args.reset_endpoint);
     }
 }
 
