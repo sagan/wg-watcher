@@ -1,8 +1,9 @@
 # wg-watcher
 
-`wg-watcher` is a unified daemon that combines two WireGuard utilities into a single program:
+`wg-watcher` is a unified daemon that combines three WireGuard utilities into a single program:
 1. **Dynamic AllowedIPs**: Watches Linux kernel routes and dynamically updates WireGuard peers' `allowed-ips`.
 2. **Keepalived**: Monitors WireGuard handshakes and resets the `listen-port` to `0` if a handshake times out.
+3. **P2P Relay Fallback**: Automatically falls back direct P2P traffic to server relay mode when a direct connection is down, and restores P2P routing when online.
 
 ## 1. Dynamic AllowedIPs
 
@@ -25,13 +26,38 @@ Monitors WireGuard interface connections to keep client sessions alive.
 How it works:
 1. Runs `wg show all dump` periodically (every 25 seconds) and parses the result.
 2. For each specified `wg` interface that has at least one peer with "persistent keepalive" set, if the "latest handshake" is older than 180 seconds (wg session key valid time limit), it runs `wg set <interface> listen-port 0` to randomize the listen port and force a handshake attempt to reconnect.
-3. It also updates the endpoint to the one defined in the static config if the current endpoint is inaccessible and different from the one in the static config. It does DNS resolving internally and round-robins through all resolved IPs
-if the hostname part of wg.conf `Endpoint` is a domain.
+3. It also updates the endpoint to the one defined in the static config if the current endpoint is inaccessible and different from the one in the static config. It does DNS resolving internally and round-robins through all resolved IPs if the hostname part of wg.conf `Endpoint` is a domain.
+
+## 3. P2P Relay Fallback
+
+Designed for WireGuard networks that use a hub-and-spoke topology with direct peer-to-peer (P2P) connections configured for performance reasons.
+
+Example node `wg.conf`:
+```ini
+[Interface]
+Address = 192.168.110.50/24
+
+[Peer]
+# server / hub
+AllowedIPs = 192.168.110.0/24
+Endpoint = server.example.com:51820
+
+[Peer]
+# bar (direct P2P)
+AllowedIPs = 192.168.110.100/32
+Endpoint = bar.example.com:51820
+```
+
+How it works:
+1. Automatically identifies the "server" node (whose first `AllowedIPs` matches the interface subnet, e.g. `192.168.110.0/24`) and "client" nodes (whose first `AllowedIPs` is a `/32` within the server subnet, e.g. `192.168.110.100/32`).
+2. When `--enable-relay-fallback` is set:
+   - If a client peer goes DOWN (handshake > 180s) and the server peer is UP, it dynamically removes the client's `/32` IP from its `allowed-ips`. WireGuard's longest prefix match (LPM) routing immediately falls back to routing traffic destined for that client through the server relay (`192.168.110.0/24`).
+   - When the client peer comes back ONLINE (handshake <= 180s), it automatically restores the `/32` IP to the peer's `allowed-ips` so direct P2P communication resumes.
 
 ## Usage
 
 ```
-# ./wg-watcher  -h
+# ./wg-watcher -h
 wg-watcher: A combined WireGuard utility daemon.
 
 Features:
@@ -43,8 +69,10 @@ Features:
    endpoint is inaccessible and different from the one in the static config.
    It does DNS resolving internally and round-robins through all resolved IPs
    if the hostname part of wg.conf `Endpoint` is a domain.
-   When `--enable-multiple-endpoints` is passed, it allows peers to define multiple `Endpoint`
-   lines in `wg.conf`, trying them in reverse order of appearance (since `wg-quick` uses the last defined endpoint).
+3. P2P Relay Fallback: Monitors direct peer-to-peer client peer status in hub-and-spoke
+   topologies. When a client peer times out (> 180s) while the server/hub peer is up,
+   it dynamically removes the client's /32 from AllowedIPs to fallback traffic to the server.
+   When the client peer is back online, it automatically restores the AllowedIPs.
 
 
 Usage: wg-watcher [OPTIONS]
@@ -56,6 +84,7 @@ Options:
       --disable-endpoint-watcher  Disable tracking and applying endpoints from config for stale peers
       --disable-dns-resolution    Disable tracking failed IP addresses for DNS-resolved endpoints
       --enable-multiple-endpoints Enable watching and rotating through multiple Endpoint definitions per peer in wg.conf
+      --enable-relay-fallback     Enable automatic fallback to server relay when a direct P2P client peer handshake times out (> 180s)
       --reset-endpoint            Parse config file, reset all peer endpoints to their primary endpoint, and exit
   -h, --help                      Print help
   -V, --version                   Print version

@@ -6,8 +6,9 @@ use signal_hook::iterator::Signals;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::net::ToSocketAddrs;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::process::{Command, Stdio};
+use std::str::FromStr;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -31,6 +32,10 @@ Features:
    endpoint is inaccessible and different from the one in the static config.
    It does DNS resolving internally and round-robins through all resolved IPs
    if the hostname part of wg.conf `Endpoint` is a domain.
+3. P2P Relay Fallback: Monitors direct peer-to-peer client peer status in hub-and-spoke
+   topologies. When a client peer times out (> 180s) while the server/hub peer is up,
+   it dynamically removes the client's /32 from AllowedIPs to fallback traffic to the server.
+   When the client peer is back online, it automatically restores the AllowedIPs.
 "#
 )]
 struct Args {
@@ -59,6 +64,10 @@ struct Args {
     #[arg(long)]
     enable_multiple_endpoints: bool,
 
+    /// Enable automatic fallback to server relay when a direct P2P client peer handshake times out (> 180s).
+    #[arg(long, alias = "enable-p2p-fallback", alias = "enable-p2p-relay-fallback")]
+    enable_relay_fallback: bool,
+
     /// Parse config file, reset all peer endpoints to their primary endpoint, and exit.
     #[arg(long)]
     reset_endpoint: bool,
@@ -79,16 +88,192 @@ struct PeerState {
     current_ips: Vec<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct PeerConfig {
     allowed_ips: Vec<String>,
     endpoints: Vec<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct WgConfig {
+    interface_addresses: Vec<String>,
     listen_port: Option<u16>,
     peers: std::collections::HashMap<String, PeerConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CidrNet {
+    ip: IpAddr,
+    prefix_len: u8,
+}
+
+impl CidrNet {
+    fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        let (ip_str, mask_str) = match s.split_once('/') {
+            Some((ip, mask)) => (ip, Some(mask)),
+            None => (s, None),
+        };
+
+        let ip = IpAddr::from_str(ip_str).ok()?;
+        let prefix_len = match mask_str {
+            Some(m) => m.parse::<u8>().ok()?,
+            None => match ip {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            },
+        };
+
+        match ip {
+            IpAddr::V4(_) if prefix_len > 32 => return None,
+            IpAddr::V6(_) if prefix_len > 128 => return None,
+            _ => {}
+        }
+
+        Some(CidrNet { ip, prefix_len })
+    }
+
+    fn to_network_cidr(&self) -> String {
+        match self.ip {
+            IpAddr::V4(v4) => {
+                let mask = if self.prefix_len == 0 {
+                    0u32
+                } else {
+                    !((1u64 << (32 - self.prefix_len)) - 1) as u32
+                };
+                let net_ip = Ipv4Addr::from(u32::from(v4) & mask);
+                format!("{}/{}", net_ip, self.prefix_len)
+            }
+            IpAddr::V6(v6) => {
+                let mask = if self.prefix_len == 0 {
+                    0u128
+                } else {
+                    !((1u128 << (128 - self.prefix_len)) - 1)
+                };
+                let net_ip = Ipv6Addr::from(u128::from(v6) & mask);
+                format!("{}/{}", net_ip, self.prefix_len)
+            }
+        }
+    }
+
+    fn contains(&self, other: &CidrNet) -> bool {
+        match (self.ip, other.ip) {
+            (IpAddr::V4(a), IpAddr::V4(b)) => {
+                if self.prefix_len > other.prefix_len {
+                    return false;
+                }
+                let mask = if self.prefix_len == 0 {
+                    0u32
+                } else {
+                    !((1u64 << (32 - self.prefix_len)) - 1) as u32
+                };
+                (u32::from(a) & mask) == (u32::from(b) & mask)
+            }
+            (IpAddr::V6(a), IpAddr::V6(b)) => {
+                if self.prefix_len > other.prefix_len {
+                    return false;
+                }
+                let mask = if self.prefix_len == 0 {
+                    0u128
+                } else {
+                    !((1u128 << (128 - self.prefix_len)) - 1)
+                };
+                (u128::from(a) & mask) == (u128::from(b) & mask)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_host(&self) -> bool {
+        match self.ip {
+            IpAddr::V4(_) => self.prefix_len == 32,
+            IpAddr::V6(_) => self.prefix_len == 128,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeerClassification {
+    // Map server_pubkey -> Vec of served network CIDRs (e.g. "192.168.110.0/24")
+    server_peers: HashMap<String, Vec<CidrNet>>,
+    // Map client_pubkey -> (client_anchor_ip_cidr e.g. "192.168.110.100/32", server_pubkey)
+    client_peers: HashMap<String, (String, String)>,
+}
+
+fn classify_peers(config: &WgConfig) -> PeerClassification {
+    let mut server_peers: HashMap<String, Vec<CidrNet>> = HashMap::new();
+    let mut client_peers: HashMap<String, (String, String)> = HashMap::new();
+
+    // 1. Calculate interface subnets if available
+    let interface_subnets: Vec<CidrNet> = config
+        .interface_addresses
+        .iter()
+        .filter_map(|addr| CidrNet::parse(addr))
+        .filter_map(|cidr| CidrNet::parse(&cidr.to_network_cidr()))
+        .collect();
+
+    // 2. Identify server peers
+    // A peer is recognized as a server peer if its first AllowedIP is a subnet (or matches interface subnet)
+    for (pubkey, peer_cfg) in &config.peers {
+        if let Some(first_ip_str) = peer_cfg.allowed_ips.first() {
+            if let Some(first_cidr) = CidrNet::parse(first_ip_str) {
+                let is_server = if !interface_subnets.is_empty() {
+                    interface_subnets.iter().any(|if_sub| {
+                        first_cidr.to_network_cidr() == if_sub.to_network_cidr()
+                            || first_cidr.contains(if_sub)
+                    })
+                } else {
+                    !first_cidr.is_host()
+                };
+
+                if is_server {
+                    server_peers
+                        .entry(pubkey.clone())
+                        .or_default()
+                        .push(first_cidr);
+                }
+            }
+        }
+    }
+
+    // 3. Identify client peers
+    // A peer is recognized as a client peer if:
+    // - it is not a server peer
+    // - its first AllowedIP is a host IP (/32 or /128)
+    // - that host IP falls within one of the server peer subnets
+    for (pubkey, peer_cfg) in &config.peers {
+        if server_peers.contains_key(pubkey) {
+            continue;
+        }
+
+        if let Some(first_ip_str) = peer_cfg.allowed_ips.first() {
+            if let Some(client_cidr) = CidrNet::parse(first_ip_str) {
+                if client_cidr.is_host() {
+                    for (server_pubkey, server_subnets) in &server_peers {
+                        if server_subnets.iter().any(|sub| sub.contains(&client_cidr)) {
+                            let normalized_client_ip = normalize_ip(first_ip_str);
+                            client_peers.insert(
+                                pubkey.clone(),
+                                (normalized_client_ip, server_pubkey.clone()),
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    PeerClassification {
+        server_peers,
+        client_peers,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PeerDumpRecord {
+    allowed_ips: String,
+    latest_handshake: u64,
 }
 
 fn main() {
@@ -127,12 +312,17 @@ fn main() {
         println!("Multiple endpoints watching enabled (trying defined endpoints in reverse config order).");
     }
 
+    if args.enable_relay_fallback {
+        println!("P2P relay fallback enabled (automatically fallback to server relay when direct P2P connection times out).");
+    }
+
     // 2. Spawn keepalived thread
     let keepalive_iface = args.interface.clone();
     let keepalive_config_dir = args.config_dir.clone();
     let disable_endpoint_watcher = args.disable_endpoint_watcher;
     let disable_dns_resolution = args.disable_dns_resolution;
     let enable_multiple_endpoints = args.enable_multiple_endpoints;
+    let enable_relay_fallback = args.enable_relay_fallback;
 
     thread::spawn(move || {
         println!(
@@ -148,6 +338,7 @@ fn main() {
                 disable_endpoint_watcher,
                 disable_dns_resolution,
                 enable_multiple_endpoints,
+                enable_relay_fallback,
                 &mut failed_endpoints,
             ) {
                 eprintln!("Error during keepalived check cycle: {}", e);
@@ -157,7 +348,7 @@ fn main() {
     });
 
     // 3. Run a full scan and update on program start for allowed-ips
-    sync_state(&args.interface, &args.config_dir);
+    sync_state(&args.interface, &args.config_dir, args.enable_relay_fallback);
 
     // 4. Setup channels for allowed-ips triggers
     let (tx, rx) = mpsc::channel();
@@ -217,7 +408,7 @@ fn main() {
             }
 
             println!("\nAllowed-ips trigger detected and debounced. Synchronizing...");
-            sync_state(&args.interface, &args.config_dir);
+            sync_state(&args.interface, &args.config_dir, args.enable_relay_fallback);
         }
     }
 }
@@ -228,6 +419,7 @@ fn check_and_recover(
     disable_endpoint_watcher: bool,
     disable_dns_resolution: bool,
     enable_multiple_endpoints: bool,
+    enable_relay_fallback: bool,
     failed_endpoints: &mut HashMap<String, HashMap<String, u64>>,
 ) -> std::io::Result<()> {
     // 1. Run "wg show all dump"
@@ -252,6 +444,8 @@ fn check_and_recover(
     // Use a Set to avoid resetting the same interface multiple times in one cycle
     let mut stale_interfaces = HashSet::new();
     let mut interface_configs: HashMap<String, WgConfig> = HashMap::new();
+    let mut peer_dump_map: HashMap<(String, String), PeerDumpRecord> = HashMap::new();
+    let mut observed_interfaces = HashSet::new();
 
     for line in stdout.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
@@ -272,23 +466,37 @@ fn check_and_recover(
             continue;
         }
 
+        let peer_pub = fields[1];
+        let current_endpoint = fields[3];
+        let allowed_ips_str = fields[4];
         let latest_handshake_str = fields[5];
         let keepalive_str = fields[8];
 
-        // 2. Filter: Must have PersistentKeepalive set (not "off" and not "0")
+        let latest_handshake = latest_handshake_str.parse::<u64>().unwrap_or(0);
         let keepalive = keepalive_str.parse::<u64>().unwrap_or(0);
+
+        observed_interfaces.insert(interface.to_string());
+        peer_dump_map.insert(
+            (interface.to_string(), peer_pub.to_string()),
+            PeerDumpRecord {
+                allowed_ips: allowed_ips_str.to_string(),
+                latest_handshake,
+            },
+        );
+
+        // 2. Filter: Must have PersistentKeepalive set (not "off" and not "0")
         if keepalive == 0 {
             continue;
         }
 
         // 3. Check Handshake Age
-        let latest_handshake = latest_handshake_str.parse::<u64>().unwrap_or(now);
-        let age = now.saturating_sub(latest_handshake);
+        let age = if latest_handshake == 0 {
+            now
+        } else {
+            now.saturating_sub(latest_handshake)
+        };
 
         if age > HANDSHAKE_TIMEOUT_SEC {
-            let peer_pub = fields[1];
-            let current_endpoint = fields[3];
-
             // Record this current endpoint as failed right now.
             if current_endpoint != "(none)" {
                 failed_endpoints
@@ -363,7 +571,7 @@ fn check_and_recover(
                             if chosen_endpoint != current_endpoint {
                                 println!(
                                     "[{}] Stale endpoint detected! Interface: {}, Peer: {}, Old: {}, New: {}",
-                                    now, interface, &peer_pub[..8], current_endpoint, chosen_endpoint
+                                    now, interface, &peer_pub[..8.min(peer_pub.len())], current_endpoint, chosen_endpoint
                                 );
                                 let status = Command::new("wg")
                                     .args(["set", interface, "peer", peer_pub, "endpoint", chosen_endpoint])
@@ -403,8 +611,6 @@ fn check_and_recover(
             }
         } else {
             // Handshake is recent, connection is healthy.
-            let current_endpoint = fields[3];
-            let peer_pub = fields[1];
             if current_endpoint != "(none)" {
                 if let Some(peer_fails) = failed_endpoints.get_mut(peer_pub) {
                     peer_fails.remove(current_endpoint);
@@ -419,6 +625,118 @@ fn check_and_recover(
     // 4. Action: Reset port for stale interfaces
     for interface in stale_interfaces {
         randomize_listen_port(&interface)?;
+    }
+
+    // 5. Action: P2P Relay Fallback management
+    if enable_relay_fallback && config_dir.to_lowercase() != "none" {
+        for iface in &observed_interfaces {
+            let conf = interface_configs.entry(iface.clone()).or_insert_with(|| {
+                let conf_path = format!("{}/{}.conf", config_dir, iface);
+                parse_wg_conf(&conf_path)
+            });
+
+            let classification = classify_peers(conf);
+            if classification.server_peers.is_empty() || classification.client_peers.is_empty() {
+                continue;
+            }
+
+            // Check if server peer(s) are UP
+            let mut server_up_map: HashMap<String, bool> = HashMap::new();
+            for server_pubkey in classification.server_peers.keys() {
+                let is_up = if let Some(dump_rec) = peer_dump_map.get(&(iface.clone(), server_pubkey.clone())) {
+                    dump_rec.latest_handshake > 0
+                        && (now.saturating_sub(dump_rec.latest_handshake) <= HANDSHAKE_TIMEOUT_SEC)
+                } else {
+                    false
+                };
+                server_up_map.insert(server_pubkey.clone(), is_up);
+            }
+
+            for (client_pubkey, (client_anchor_ip, server_pubkey)) in &classification.client_peers {
+                let server_is_up = server_up_map.get(server_pubkey).copied().unwrap_or(false);
+
+                if let Some(dump_rec) = peer_dump_map.get(&(iface.clone(), client_pubkey.clone())) {
+                    let client_handshake = dump_rec.latest_handshake;
+                    let client_age = if client_handshake == 0 {
+                        now
+                    } else {
+                        now.saturating_sub(client_handshake)
+                    };
+                    let client_is_down = client_handshake == 0 || client_age > HANDSHAKE_TIMEOUT_SEC;
+
+                    let current_allowed_ips: Vec<String> = if dump_rec.allowed_ips == "(none)" {
+                        Vec::new()
+                    } else {
+                        dump_rec
+                            .allowed_ips
+                            .split(',')
+                            .map(|s| normalize_ip(s.trim()))
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    };
+
+                    let normalized_anchor = normalize_ip(client_anchor_ip);
+                    let contains_anchor = current_allowed_ips.contains(&normalized_anchor);
+
+                    if client_is_down && server_is_up {
+                        // Fallback condition: client is down, server is up, and client still has its AllowedIP
+                        if contains_anchor {
+                            let remaining_ips: Vec<String> = current_allowed_ips
+                                .into_iter()
+                                .filter(|ip| *ip != normalized_anchor)
+                                .collect();
+                            let new_ips_arg = remaining_ips.join(",");
+
+                            let client_short = &client_pubkey[..8.min(client_pubkey.len())];
+                            let server_short = &server_pubkey[..8.min(server_pubkey.len())];
+                            println!(
+                                "[{}] Fallback to server relay: Client peer {} is DOWN (handshake age: {}s), server {} is UP. Removing {} from allowed-ips (remaining: '{}')",
+                                now, client_short, client_age, server_short, normalized_anchor, new_ips_arg
+                            );
+
+                            let status = Command::new("wg")
+                                .args(["set", iface, "peer", client_pubkey, "allowed-ips", &new_ips_arg])
+                                .status();
+
+                            if let Err(e) = status {
+                                eprintln!("Failed to remove allowed-ips for peer {}: {}", client_pubkey, e);
+                            }
+                        }
+                    } else if !client_is_down {
+                        // Recovery condition: client is back online, but anchor AllowedIP is missing
+                        if !contains_anchor {
+                            let mut restored_ips: Vec<String> = current_allowed_ips;
+                            if !restored_ips.contains(&normalized_anchor) {
+                                restored_ips.insert(0, normalized_anchor.clone());
+                            }
+                            if let Some(static_peer) = conf.peers.get(client_pubkey) {
+                                for ip in &static_peer.allowed_ips {
+                                    let norm = normalize_ip(ip);
+                                    if !restored_ips.contains(&norm) {
+                                        restored_ips.push(norm);
+                                    }
+                                }
+                            }
+                            let restored_ips_arg = restored_ips.join(",");
+
+                            let client_short = &client_pubkey[..8.min(client_pubkey.len())];
+                            println!(
+                                "[{}] Restored P2P direct: Client peer {} is back ONLINE (handshake age: {}s). Restoring allowed-ips to '{}'",
+                                now, client_short, client_age, restored_ips_arg
+                            );
+
+                            let status = Command::new("wg")
+                                .args(["set", iface, "peer", client_pubkey, "allowed-ips", &restored_ips_arg])
+                                .status();
+
+                            if let Err(e) = status {
+                                eprintln!("Failed to restore allowed-ips for peer {}: {}", client_pubkey, e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -445,7 +763,7 @@ fn randomize_listen_port(interface: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn sync_state(target_interface: &Option<String>, config_dir: &str) {
+fn sync_state(target_interface: &Option<String>, config_dir: &str, enable_relay_fallback: bool) {
     let routes = get_bird_routes();
 
     let mut ifaces_to_update = HashSet::new();
@@ -464,7 +782,7 @@ fn sync_state(target_interface: &Option<String>, config_dir: &str) {
     }
 
     for iface in ifaces_to_update {
-        update_wireguard_interface(&iface, &routes, config_dir);
+        update_wireguard_interface(&iface, &routes, config_dir, enable_relay_fallback);
     }
 }
 
@@ -513,6 +831,7 @@ fn parse_wg_conf(path: &str) -> WgConfig {
 
     let reader = BufReader::new(file);
     let mut current_pubkey: Option<String> = None;
+    let mut in_interface_section = false;
 
     for line in reader.lines().filter_map(Result::ok) {
         let line = line.split('#').next().unwrap_or("").trim();
@@ -520,39 +839,57 @@ fn parse_wg_conf(path: &str) -> WgConfig {
             continue;
         }
 
-        if line.starts_with("[Peer]") {
+        if line.eq_ignore_ascii_case("[interface]") {
+            in_interface_section = true;
             current_pubkey = None;
-        } else if line.to_lowercase().starts_with("listenport") {
-            if let Some((_, port_str)) = line.split_once('=') {
-                if let Ok(port) = port_str.trim().parse::<u16>() {
-                    config.listen_port = Some(port);
-                }
-            }
-        } else if line.to_lowercase().starts_with("publickey") {
-            if let Some((_, key)) = line.split_once('=') {
-                let key = key.trim().to_string();
-                current_pubkey = Some(key.clone());
-                config.peers.entry(key).or_insert_with(PeerConfig::default);
-            }
-        } else if line.to_lowercase().starts_with("allowedips") {
-            if let Some(pubkey) = &current_pubkey {
-                if let Some((_, ips_str)) = line.split_once('=') {
-                    let ips: Vec<String> = ips_str
+        } else if line.eq_ignore_ascii_case("[peer]") {
+            in_interface_section = false;
+            current_pubkey = None;
+        } else if in_interface_section {
+            if line.to_lowercase().starts_with("address") {
+                if let Some((_, addr_str)) = line.split_once('=') {
+                    let addrs: Vec<String> = addr_str
                         .split(',')
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .collect();
-
-                    if let Some(peer_cfg) = config.peers.get_mut(pubkey) {
-                        peer_cfg.allowed_ips.extend(ips);
+                    config.interface_addresses.extend(addrs);
+                }
+            } else if line.to_lowercase().starts_with("listenport") {
+                if let Some((_, port_str)) = line.split_once('=') {
+                    if let Ok(port) = port_str.trim().parse::<u16>() {
+                        config.listen_port = Some(port);
                     }
                 }
             }
-        } else if line.to_lowercase().starts_with("endpoint") {
-            if let Some(pubkey) = &current_pubkey {
-                if let Some((_, endpoint_str)) = line.split_once('=') {
-                    if let Some(peer_cfg) = config.peers.get_mut(pubkey) {
-                        peer_cfg.endpoints.push(endpoint_str.trim().to_string());
+        } else {
+            // Peer section
+            if line.to_lowercase().starts_with("publickey") {
+                if let Some((_, key)) = line.split_once('=') {
+                    let key = key.trim().to_string();
+                    current_pubkey = Some(key.clone());
+                    config.peers.entry(key).or_insert_with(PeerConfig::default);
+                }
+            } else if line.to_lowercase().starts_with("allowedips") {
+                if let Some(pubkey) = &current_pubkey {
+                    if let Some((_, ips_str)) = line.split_once('=') {
+                        let ips: Vec<String> = ips_str
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+
+                        if let Some(peer_cfg) = config.peers.get_mut(pubkey) {
+                            peer_cfg.allowed_ips.extend(ips);
+                        }
+                    }
+                }
+            } else if line.to_lowercase().starts_with("endpoint") {
+                if let Some(pubkey) = &current_pubkey {
+                    if let Some((_, endpoint_str)) = line.split_once('=') {
+                        if let Some(peer_cfg) = config.peers.get_mut(pubkey) {
+                            peer_cfg.endpoints.push(endpoint_str.trim().to_string());
+                        }
                     }
                 }
             }
@@ -561,7 +898,12 @@ fn parse_wg_conf(path: &str) -> WgConfig {
     config
 }
 
-fn update_wireguard_interface(iface: &str, all_routes: &[Route], config_dir: &str) {
+fn update_wireguard_interface(
+    iface: &str,
+    all_routes: &[Route],
+    config_dir: &str,
+    enable_relay_fallback: bool,
+) {
     let output = Command::new("wg")
         .args(["show", iface, "allowed-ips"])
         .output();
@@ -606,21 +948,44 @@ fn update_wireguard_interface(iface: &str, all_routes: &[Route], config_dir: &st
         WgConfig::default()
     };
 
+    let classification = if enable_relay_fallback {
+        Some(classify_peers(&static_config))
+    } else {
+        None
+    };
+
     for peer in active_peers {
         let mut target_ips_set: HashSet<String> = HashSet::new();
 
+        let is_client_in_fallback = if let Some(ref class) = classification {
+            if let Some((client_anchor_ip, _)) = class.client_peers.get(&peer.pubkey) {
+                // If the client's current IPs does not contain its anchor IP, it was removed for fallback
+                !peer.current_ips.iter().any(|ip| normalize_ip(ip) == normalize_ip(client_anchor_ip))
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         if let Some(static_peer) = static_config.peers.get(&peer.pubkey) {
             for ip in &static_peer.allowed_ips {
-                // Apply normalization here
-                target_ips_set.insert(normalize_ip(ip));
+                let norm = normalize_ip(ip);
+                if is_client_in_fallback && classification.as_ref().map_or(false, |c| {
+                    c.client_peers.get(&peer.pubkey).map_or(false, |(anchor, _)| normalize_ip(anchor) == norm)
+                }) {
+                    continue;
+                }
+                target_ips_set.insert(norm);
             }
         }
 
-        target_ips_set.insert(peer.anchor_with_mask.clone());
+        if !is_client_in_fallback {
+            target_ips_set.insert(peer.anchor_with_mask.clone());
+        }
 
         for route in all_routes {
             if route.dev == iface && route.via_ip == peer.anchor_ip_stripped {
-                // Apply normalization here
                 target_ips_set.insert(normalize_ip(&route.prefix));
             }
         }
@@ -636,12 +1001,16 @@ fn update_wireguard_interface(iface: &str, all_routes: &[Route], config_dir: &st
 
             remaining_ips.sort();
 
-            let mut final_ips_vec = vec![peer.anchor_with_mask.clone()];
+            let mut final_ips_vec = if !is_client_in_fallback {
+                vec![peer.anchor_with_mask.clone()]
+            } else {
+                Vec::new()
+            };
             final_ips_vec.extend(remaining_ips);
 
             let joined_ips = final_ips_vec.join(",");
 
-            println!("State change for peer {}:", &peer.pubkey[..8]);
+            println!("State change for peer {}:", &peer.pubkey[..8.min(peer.pubkey.len())]);
             println!("  Old: {}", peer.current_ips.join(","));
             println!("  New: {}", joined_ips);
 
@@ -815,6 +1184,111 @@ Endpoint = 2.3.4.5:51820
     fn test_reset_endpoint_flag_arg_parse() {
         let args = Args::parse_from(["wg-watcher", "--reset-endpoint"]);
         assert!(args.reset_endpoint);
+    }
+
+    #[test]
+    fn test_relay_fallback_flag_arg_parse() {
+        let args = Args::parse_from(["wg-watcher", "--enable-relay-fallback"]);
+        assert!(args.enable_relay_fallback);
+
+        let args2 = Args::parse_from(["wg-watcher", "--enable-p2p-fallback"]);
+        assert!(args2.enable_relay_fallback);
+
+        let args3 = Args::parse_from(["wg-watcher", "--enable-p2p-relay-fallback"]);
+        assert!(args3.enable_relay_fallback);
+    }
+
+    #[test]
+    fn test_cidr_net_operations() {
+        let cidr = CidrNet::parse("192.168.110.50/24").unwrap();
+        assert_eq!(cidr.to_network_cidr(), "192.168.110.0/24");
+        assert!(!cidr.is_host());
+
+        let host = CidrNet::parse("192.168.110.100/32").unwrap();
+        assert!(host.is_host());
+        assert_eq!(host.to_network_cidr(), "192.168.110.100/32");
+
+        let net = CidrNet::parse("192.168.110.0/24").unwrap();
+        assert!(net.contains(&host));
+        assert!(net.contains(&cidr));
+
+        let outside = CidrNet::parse("192.168.111.100/32").unwrap();
+        assert!(!net.contains(&outside));
+
+        // Implicit mask
+        let implicit_v4 = CidrNet::parse("10.0.0.1").unwrap();
+        assert_eq!(implicit_v4.prefix_len, 32);
+        assert!(implicit_v4.is_host());
+
+        // IPv6
+        let v6_net = CidrNet::parse("fd00::1/64").unwrap();
+        assert_eq!(v6_net.to_network_cidr(), "fd00::/64");
+        let v6_host = CidrNet::parse("fd00::50/128").unwrap();
+        assert!(v6_net.contains(&v6_host));
+    }
+
+    #[test]
+    fn test_parse_wg_conf_and_classify_peers() {
+        let conf_content = r#"
+[Interface]
+Address = 192.168.110.50/24
+ListenPort = 51820
+
+[peer]
+# server
+PublicKey = server_pubkey_11111111111111111111111111111111
+AllowedIPs = 192.168.110.0/24
+Endpoint = server.example.com:51820
+
+[peer]
+# bar
+PublicKey = bar_client_pubkey_22222222222222222222222222222
+AllowedIPs = 192.168.110.100/32
+Endpoint = bar.example.com:51820
+
+[peer]
+# baz (using implicit /32)
+PublicKey = baz_client_pubkey_33333333333333333333333333333
+AllowedIPs = 192.168.110.101
+Endpoint = baz.example.com:51820
+"#;
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("test_wg_topology.conf");
+        std::fs::write(&test_file, conf_content).unwrap();
+
+        let config = parse_wg_conf(test_file.to_str().unwrap());
+        assert_eq!(config.interface_addresses, vec!["192.168.110.50/24"]);
+        assert_eq!(config.listen_port, Some(51820));
+        assert_eq!(config.peers.len(), 3);
+
+        let classification = classify_peers(&config);
+
+        // Server peer check
+        assert!(classification.server_peers.contains_key("server_pubkey_11111111111111111111111111111111"));
+        assert_eq!(
+            classification.server_peers.get("server_pubkey_11111111111111111111111111111111").unwrap()[0].to_network_cidr(),
+            "192.168.110.0/24"
+        );
+
+        // Client bar check
+        assert_eq!(
+            classification.client_peers.get("bar_client_pubkey_22222222222222222222222222222"),
+            Some(&(
+                "192.168.110.100/32".to_string(),
+                "server_pubkey_11111111111111111111111111111111".to_string()
+            ))
+        );
+
+        // Client baz check (implicit /32 normalized)
+        assert_eq!(
+            classification.client_peers.get("baz_client_pubkey_33333333333333333333333333333"),
+            Some(&(
+                "192.168.110.101/32".to_string(),
+                "server_pubkey_11111111111111111111111111111111".to_string()
+            ))
+        );
+
+        std::fs::remove_file(test_file).ok();
     }
 }
 
